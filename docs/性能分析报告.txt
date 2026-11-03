@@ -1,0 +1,113 @@
+C129 基于紫光同创 FPGA 的任意角度畸变矫正系统
+原理、装置使用与性能分析
+整理日期：2026-11-03
+
+1. 系统概述
+本系统采用紫光同创 PGL50H FPGA，完成摄像头视频采集、DDR3 帧缓存、畸变坐标映射、双线性插值和 HDMI 显示。上位机负责装置控制、标定参数管理、IMU 姿态处理、预览及指标展示，图像映射和像素运算由 FPGA 执行。
+当前提交版本为 C129，构建标识 0x0720C129，视频处理分辨率 1280×720。支持原图、普通矫正、IMU 动态矫正、平面扫描和自适应增强等演示模式。完整三轴模式的上位机预览保留原来的 100% 视野。
+
+2. 装置组成与数据通路
+装置由 PGL50H 开发板、OV5640 鱼眼摄像头、DDR3 存储器、IMU、HDMI 显示或采集设备、串口连接及运行 Python 上位机的电脑组成。
+
+图像通路：
+OV5640 DVP/RGB565 → FPGA 采集与跨时钟域缓存 → DDR3 原始帧 → FPGA 坐标映射与取样 → 双线性插值 → HDMI 输出。
+姿态控制通路：
+IMU → 上位机姿态与相机坐标变换 → 串口参数更新 → FPGA 映射表重建和帧边界切换。
+采集卡把 HDMI 画面传给上位机用于预览、拍照及录像。上位机不上传预计算的整帧坐标来代替 FPGA 算法。
+
+3. 算法原理及代码对应
+3.1 畸变矫正
+采用输出像素反向映射，先由输出相机内参将像素归一化，再进行姿态/投影变换，经过镜头模型计算对应的原始图像坐标，最后读取邻近像素并插值。
+当前镜头参数来自 C97 标定，采用 OpenCV fisheye 四系数模型及独立的联合切向修正。fisheye 径向模型为：
+theta_d = theta × (1 + k1×theta² + k2×theta⁴ + k3×theta⁶ + k4×theta⁸)。
+这四个系数是同一 fisheye 模型的径向系数，切向修正另行处理。
+主要模块：complete_fisheye_mapper.v、fisheye_math.v、complete_geometry_mul32.v、map_build_controller_complete.v。
+
+3.2 像素重采样与硬件流水线
+根据映射坐标的整数部分读取邻近像素，小数部分作为双线性插值权重。分块缓存与 DDR3 访问调度减少重复读取；定点运算、分级流水线和映射表更新配合连续视频输出。
+主要模块：fast_warp_engine.v、bilinear_rgb565_pipeline.v、ddr_burst_arbiter4_complete.v、video_frame_system_complete.v。
+
+3.3 动态矫正
+上位机读取 IMU 姿态并结合安装矩阵形成相机补偿变换，通过串口发送少量参数。FPGA 使用更新后的矩阵完成坐标映射。平面旋转和完整三轴模式可分别展示；实际可见范围由镜头采集范围及姿态决定。
+主要文件：host/imu_pose.py、host/imu_session.py、uart_config_rx_complete.v。
+
+3.4 自适应图像增强
+FPGA 根据图像亮度分布选择 Gamma，并以帧级确认和渐进更新控制亮度调整；同时提供细节增强。增强运算在硬件流水线内执行。
+主要模块：complete_image_enhance.v、adaptive_gamma_rgb565.v、detail_enhance_rgb565.v。
+
+4. 装置使用方法
+（1）连接摄像头、IMU 和 FPGA；HDMI 连接显示器或采集卡，串口连接电脑。
+（2）使用 PDS 将 C129_720p_cmos1.sbit 下载到板卡。
+（3）首次运行安装带 tkinter 的 Python 3.10 或更高版本，在工程目录执行：
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\host\setup_host.ps1 -Python python
+（4）双击 start_demo.cmd，选择 FPGA 串口、IMU 串口和视频采集设备。
+（5）使用 host/calibration/C97_joint_720p/calibration.json，按实际装置安装关系设置 IMU，连接设备并打开预览。
+（6）切换原图与普通矫正比较网格直线；动态演示时记录参考姿态并同步转动相机和 IMU；按需切换增强模式观察亮部与暗部。
+（7）F8 拍照保存 PNG，F9 开始或停止录像；实测指标页可开始采集并导出数据。
+
+5. 核心性能数据
+5.1 图像清晰度和直线度
+测试图像分辨率为 1280×720；普通矫正与原图分别使用网格和斜边图卡，关闭细节增强。直线度按所有有效网格点到各自拟合直线的距离计算整体 RMS；MTF50 使用两图共有的 6 条有效边的近似 SFR 结果中位数。
+
+指标                         原图          普通矫正
+整体直线度 RMS / px          2.201         0.282
+近似 MTF50 / cycles/pixel    0.3468        0.3269
+
+整体直线度 RMS 降低 87.17%。网格图每张统计 40 条线；原图有效点 6788 个，矫正图 6008 个。以上数值按原图像像素计算。
+11 月 3 日清晰度复测摘要另有 4 组原图→矫正后 MTF50：0.385→0.285、0.329→0.298、0.369→0.292、0.344→0.319 cycles/pixel，分别统计 3、4、5、3 条共有边。各批次结果分开保留。
+
+5.2 帧率
+下列为 11 月 3 日运行日志中按上位机模式划分的板端计数结果：
+普通矫正：原始帧 30 fps；新矫正帧 30 fps；计数区间 2 s。
+自适应增强：原始帧 30 fps；新矫正帧 30 fps；计数区间 44 s。
+IMU 动态矫正：原始帧 30 fps；新矫正帧 30 fps；计数区间 160 s。
+上述选定区间内，板端下溢、溢出、丢帧和相机跳帧计数增量均为 0。
+HDMI 设计时序为约 60 Hz 刷新；上位机观察到的姿态输出确认速率约 18.96 次/秒。这两项与每秒新矫正帧数分别统计。
+
+5.3 硬件处理延迟
+计时边界：FPGA 收到相机帧首个有效像素，至同一源帧在 FPGA 视频输出端出现首个/最后一个有效像素。该计时不含相机曝光、采集卡、USB、电脑预览及显示器响应时间。
+普通矫正（69 个样本）：
+  首像素延迟 P50 71.902 ms，P95 71.955 ms；
+  整帧输出完成延迟 P50 87.899 ms，P95 87.952 ms；
+  矫正处理时间 P50 22.581 ms。
+自适应增强（1356 个样本）：
+  首像素延迟 P50 70.496 ms，P95 71.5585 ms；
+  整帧输出完成延迟 P50 86.493 ms，P95 87.5555 ms；
+  矫正处理时间 P50 22.581 ms。
+动态模式在姿态配置切换过程中按配置分别保存原始数据，未用跨配置混合样本给出单一延迟数值。
+统计说明：上述数据来自包内已有板端日志；本次导出未记录结束时的主机串口解析计数，完整记录保留在原始 summary.json 中。
+
+5.4 FPGA 资源
+器件：PGL50H，FBG484，速度等级 -6。工具：PDS 2022.2-SP6.4。
+资源     使用量 / 可用量    占用率
+LUT      30263 / 42800    70.71%
+FF       34299 / 64200    53.43%
+APM      79.5 / 84    94.64%
+DRM      92 / 134    68.66%
+CLM      10256 / 10700    95.85%
+LUT 用于控制、寻址和逻辑运算，FF 用于流水线及状态寄存器，APM 承担算术运算，DRM 用于缓存和表存储。
+
+5.5 时序
+PDS 构建结果为 PASS，记录中的已声明时序检查均通过。
+slow: Setup +0.203 ns；Hold +0.051 ns
+fast: Setup +1.834 ns；Hold +0.005 ns
+时钟约束包括 50 MHz 系统时钟、相机像素时钟、DDR3 相关时钟，以及 HDMI 像素和配置时钟。跨时钟域使用缓存、同步和握手机制，相关时钟关系在 .fdc 中声明。
+
+6. 工程与数据索引
+以下路径以 C129_compiled_final_20261031/ 为基准：
+PDS 工程：fpga_reference/project/board/build_cmos1/camera_board50.pds
+时序与引脚约束：fpga_reference/project/board/build_cmos1/camera_board50_top.fdc
+PDS 编译源码及 IP：fpga_reference/project/board/build_cmos1/source/rtl/
+主编辑源码：fpga_reference/project/rtl/
+上位机：host/；启动入口 start_demo.cmd。
+相机标定：host/calibration/C97_joint_720p/calibration.json
+构建与资源时序：fpga_reference/project/output/c129/result.json
+综合/布局布线/时序报告：主工程 synthesize/、place_route/、report_timing/。
+运行指标：host/results/demo_evidence/demo_metrics_20261103_192149_284232/summary.json 及同目录原始日志。
+导入画质数据：host/results/imported_quality_20261103/
+完整画质报告、原图、CSV 和复核程序：外层 原始指标资料/C129_指标提交材料_20261102.zip。
+复测摘要与对比图：外层 原始指标资料/C129_清晰度复测_队友资料_20261103.zip。
+
+7. 文件对应关系
+本报告依据当前最终包整理。主 PDS 的 132 项输入引用全部存在；构建记录中的 228 个输入文件和 9 个编译产物均通过 SHA256 核对，主时序约束与已编译结果匹配。
+原压缩包 SHA256：fc967f2c99bf21b17e80ee0780e2514d2b15069b7e1e3d56da943d38bb067167。
